@@ -1,5 +1,6 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
+#include <esp_system.h>
 #include "config.h"
 #include "src/services/wake_service.h"
 #include "src/services/telegram_service.h"
@@ -14,6 +15,7 @@ static String wakeChatId = "";
 static String wakeDeviceName = "";
 static String wakeDeviceIp = "";
 static int wakeDeviceProbePort = 0;
+static String wakeId;
 
 static const unsigned long WAKE_TIMEOUT_MS = 90000;
 static const unsigned long WAKE_RETRY_MS = 3000;
@@ -24,8 +26,27 @@ static void wake_clear() {
   wakeDeviceName = "";
   wakeDeviceIp = "";
   wakeDeviceProbePort = 0;
+  wakeId = "";
   wakeStartMs = 0;
   lastWakeCheck = 0;
+}
+
+String wake_new_id() {
+  char id[9];
+  snprintf(id, sizeof(id), "%08lx", (unsigned long)esp_random());
+  return String(id);
+}
+
+static void log_telegram_wake_result(const char* result) {
+  if (!log_enabled()) return;
+  DynamicJsonDocument fields(256);
+  fields["wake_id"] = wakeId;
+  fields["source"] = "telegram";
+  fields["target"] = wakeDeviceName;
+  fields["result"] = result;
+  fields["elapsed_ms"] = millis() - wakeStartMs;
+  log_event_fields(strcmp(result, "success") == 0 ? "info" : "warn",
+                   "wake", "result", fields.as<JsonObjectConst>());
 }
 
 bool wake_is_pending() {
@@ -38,6 +59,7 @@ void wake_poll() {
   if (millis() - lastWakeCheck < WAKE_RETRY_MS) return;
 
   if (wake_is_pc_reachable(wakeDeviceIp, wakeDeviceProbePort)) {
+    log_telegram_wake_result("success");
     telegram_send_text_once(wakeChatId,
                             "🖥 " + wakeDeviceName + " is now online! (took "
                             + String((millis() - wakeStartMs) / 1000) + "s)",
@@ -47,8 +69,7 @@ void wake_poll() {
   }
 
   if (millis() - wakeStartMs >= WAKE_TIMEOUT_MS) {
-    String warnMsg = "PC did not wake within " + String(WAKE_TIMEOUT_MS / 1000) + "s";
-    log_event("warn", "wake", "timeout", warnMsg.c_str());
+    log_telegram_wake_result("timeout");
     telegram_send_text_once(wakeChatId,
                             "⚠️ " + wakeDeviceName + " did not wake within "
                             + String(WAKE_TIMEOUT_MS / 1000)
@@ -61,7 +82,7 @@ void wake_poll() {
   lastWakeCheck = millis();
 }
 
-void wake_send_magic(const String& mac, const String& bcast, int port) {
+bool wake_send_magic(const String& mac, const String& bcast, int port) {
   byte macBytes[6];
   sscanf(mac.c_str(), "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
          &macBytes[0], &macBytes[1], &macBytes[2],
@@ -71,10 +92,12 @@ void wake_send_magic(const String& mac, const String& bcast, int port) {
   for (int i = 0; i < 16; i++) memcpy(&packet[6 + i * 6], macBytes, 6);
   IPAddress bcastAddr;
   bcastAddr.fromString(bcast);
-  wakeUdp.beginPacket(bcastAddr, port);
-  wakeUdp.write(packet, 102);
-  wakeUdp.endPacket();
-  log_print("WoL sent to %s via %s:%d\n", mac.c_str(), bcast.c_str(), port);
+  bool began = wakeUdp.beginPacket(bcastAddr, port) == 1;
+  size_t written = began ? wakeUdp.write(packet, sizeof(packet)) : 0;
+  bool sent = began && wakeUdp.endPacket() == 1 && written == sizeof(packet);
+  log_print("WoL %s to %s via %s:%d\n", sent ? "sent" : "send failed",
+            mac.c_str(), bcast.c_str(), port);
+  return sent;
 }
 
 bool wake_is_pc_reachable(const String& ip, int port) {
@@ -93,7 +116,11 @@ bool wake_is_pc_reachable(const String& ip, int port) {
   return r;
 }
 
-void wake_start_polling(String chatId, const String& deviceName, const String& ip, int probePort) {
+void wake_start_polling(String chatId, const String& deviceName,
+                        const String& ip, int probePort, const String& id) {
+  if (wakePending) {
+    log_telegram_wake_result("superseded");
+  }
   wakePending = true;
   wakeStartMs = millis();
   lastWakeCheck = millis();
@@ -101,5 +128,6 @@ void wake_start_polling(String chatId, const String& deviceName, const String& i
   wakeDeviceName = deviceName;
   wakeDeviceIp = ip;
   wakeDeviceProbePort = probePort;
+  wakeId = id;
   log_print("[wake] pending target=%s chat=%s\n", deviceName.c_str(), chatId.c_str());
 }

@@ -58,9 +58,9 @@ void setup() {
 
   log_print("[boot] target=%s\n", PC_NAME);
   wifi_connect();
+  log_init();
   telegram_setup();
   mqtt_setup();
-  log_init();
 
   // log once if previous run was watchdog-triggered (WiFi is up after wifi_connect)
   if (esp_reset_reason() == ESP_RST_TASK_WDT) {

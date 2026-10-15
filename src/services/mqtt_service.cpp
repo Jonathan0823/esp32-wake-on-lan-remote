@@ -36,6 +36,8 @@ static bool mqttWakePending = false;
 static unsigned long wakeStartMs = 0;
 static unsigned long lastWakeCheckMs = 0;
 static String wakeTarget = "";
+static String wakeId = "";
+static String wakeOrigin = "";
 static String wakeTargetIp = "";
 static int wakeProbePort = 0;
 
@@ -138,6 +140,44 @@ static void mqtt_publish_event(const char* event, const char* target) {
   log_print("[mqtt] event %s target=%s\n", event, target ? target : "");
 }
 
+static String mqtt_log_value(const String& value) {
+  String safe;
+  for (unsigned int i = 0; i < value.length() && safe.length() < 32; i++) {
+    char c = value[i];
+    safe += ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+             (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.')
+                ? c
+                : '_';
+  }
+  return safe;
+}
+
+static void mqtt_log_wake(const String& id, const char* event,
+                          const String& target, const char* requestType = nullptr,
+                          const char* result = nullptr, const char* reason = nullptr,
+                          bool packetAttempted = false, bool sent = false,
+                          unsigned long elapsedMs = 0,
+                          const char* origin = nullptr) {
+  if (!log_enabled()) return;
+  DynamicJsonDocument fields(512);
+  fields["wake_id"] = id;
+  fields["source"] = "mqtt";
+  fields["target"] = mqtt_log_value(target.length() > 0 ? target : String(PC_NAME));
+  if (origin) fields["origin"] = mqtt_log_value(origin);
+  if (requestType) fields["request_type"] = requestType;
+  if (result) fields["result"] = result;
+  if (reason) fields["reason"] = reason;
+  if (packetAttempted) {
+    fields["sent"] = sent;
+    fields["target_mac"] = PC_MAC;
+    fields["broadcast"] = WOL_BCAST;
+    fields["port"] = WOL_PORT;
+  }
+  if (elapsedMs > 0) fields["elapsed_ms"] = elapsedMs;
+  const char* level = reason || (packetAttempted && !sent) ? "warn" : "info";
+  log_event_fields(level, "wake", event, fields.as<JsonObjectConst>());
+}
+
 static void mqtt_publish_reply(const String& reqId, const String& cmdName,
                                 bool ok, DynamicJsonDocument& extra) {
   if (!mqttClient.connected()) return;
@@ -171,10 +211,15 @@ static void handle_ping(const String& reqId) {
 }
 
 static void mqtt_begin_wake(const char* target, const String& reqId,
-                            const char* cmdName, bool forced) {
-  wake_send_magic(PC_MAC, WOL_BCAST, WOL_PORT);
+                            const char* cmdName, bool forced,
+                            const String& id) {
+  bool sent = wake_send_magic(PC_MAC, WOL_BCAST, WOL_PORT);
+  wakeId = id;
+  mqtt_log_wake(wakeId, "packet_sent", target, nullptr,
+                sent ? "sent" : "send_failed", nullptr, true, sent, 0,
+                wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
 
-  lastWakeResult = "wol_sent";
+  lastWakeResult = sent ? "wol_sent" : "wol_send_failed";
   lastWakeAt = millis() / 1000;
 
   mqttWakePending = true;
@@ -188,27 +233,45 @@ static void mqtt_begin_wake(const char* target, const String& reqId,
 
   DynamicJsonDocument extra(128);
   extra["target"] = target;
-  extra["result"] = "wol_sent";
+  extra["result"] = lastWakeResult;
+  extra["sent"] = sent;
   if (forced) {
     extra["forced"] = true;
   }
-  mqtt_publish_reply(reqId, cmdName, true, extra);
+  mqtt_publish_reply(reqId, cmdName, sent, extra);
   mqtt_publish_state(true);
-  mqtt_publish_event("wol_sent", target);
-  log_print("[mqtt] wake sent target=%s forced=%d\n", target, forced);
+  mqtt_publish_event(sent ? "wol_sent" : "wol_send_failed", target);
+  log_print("[mqtt] wake %s target=%s forced=%d\n",
+            sent ? "sent" : "send failed", target, forced);
 }
 
 static void handle_wake_request(const String& reqId, DynamicJsonDocument& doc) {
   const char* target = doc["target"] | "";
   unsigned long expiresIn = doc["expires_in_s"] | 30;
   bool forceWake = doc["force"] | false;
+  String origin = doc["origin"] | "";
+  if (origin.length() > 32) origin.remove(32);
+  if (wakeId.length() > 0 &&
+      (wakeConfirmToken.length() > 0 || (forceWake && mqttWakePending))) {
+    mqtt_log_wake(wakeId, "result", wakeTarget, "wake_request", "superseded",
+                  nullptr, false, false, 0,
+                  wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
+  }
+  String requestWakeId = wake_new_id();
+  mqtt_log_wake(requestWakeId, "request_received", target, "wake_request",
+                nullptr, nullptr, false, false, 0,
+                origin.length() > 0 ? origin.c_str() : nullptr);
 
   if (forceWake) {
-    mqtt_begin_wake(target, reqId, "wake_request", true);
+    wakeOrigin = origin;
+    mqtt_begin_wake(target, reqId, "wake_request", true, requestWakeId);
     return;
   }
 
   if (mqttWakePending) {
+    mqtt_log_wake(requestWakeId, "request_rejected", target, "wake_request",
+                  nullptr, "already_pending", false, false, 0,
+                  origin.length() > 0 ? origin.c_str() : nullptr);
     DynamicJsonDocument extra(64);
     extra["status"] = "already_pending";
     extra["target"] = wakeTarget;
@@ -225,6 +288,11 @@ static void handle_wake_request(const String& reqId, DynamicJsonDocument& doc) {
   wakeConfirmToken = generate_token();
   wakeConfirmExpiresMs = millis() + (expiresIn * 1000UL);
   wakeTarget = target;
+  wakeId = requestWakeId;
+  wakeOrigin = origin;
+  mqtt_log_wake(wakeId, "confirmation_required", target, "wake_request",
+                nullptr, nullptr, false, false, 0,
+                wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
 
   DynamicJsonDocument extra(128);
   extra["status"] = "confirmation_required";
@@ -239,8 +307,19 @@ static void handle_wake_request(const String& reqId, DynamicJsonDocument& doc) {
 static void handle_wake_confirm(const String& reqId, DynamicJsonDocument& doc) {
   const char* token = doc["confirm_token"] | "";
   const char* target = doc["target"] | "";
+  String origin = doc["origin"] | "";
+  if (origin.length() > 32) origin.remove(32);
+  bool validToken = String(token) == wakeConfirmToken && wakeConfirmToken.length() > 0;
+  String confirmWakeId = validToken ? wakeId : wake_new_id();
+  const char* eventOrigin = validToken
+                                ? (wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr)
+                                : (origin.length() > 0 ? origin.c_str() : nullptr);
+  mqtt_log_wake(confirmWakeId, "request_received", target, "wake_confirm",
+                nullptr, nullptr, false, false, 0, eventOrigin);
 
   if (!mqttWakePending && wakeConfirmToken.length() == 0) {
+    mqtt_log_wake(confirmWakeId, "request_rejected", target, "wake_confirm",
+                  nullptr, "no_pending_request", false, false, 0, eventOrigin);
     DynamicJsonDocument extra(64);
     extra["status"] = "no_pending_request";
     mqtt_publish_reply(reqId, "wake_confirm", false, extra);
@@ -248,7 +327,9 @@ static void handle_wake_confirm(const String& reqId, DynamicJsonDocument& doc) {
     return;
   }
 
-  if (String(token) != wakeConfirmToken) {
+  if (!validToken) {
+    mqtt_log_wake(confirmWakeId, "request_rejected", target, "wake_confirm",
+                  nullptr, "invalid_token", false, false, 0, eventOrigin);
     DynamicJsonDocument extra(64);
     extra["status"] = "invalid_token";
     mqtt_publish_reply(reqId, "wake_confirm", false, extra);
@@ -257,22 +338,35 @@ static void handle_wake_confirm(const String& reqId, DynamicJsonDocument& doc) {
   }
 
   if (millis() > wakeConfirmExpiresMs) {
+    mqtt_log_wake(confirmWakeId, "request_rejected", target, "wake_confirm",
+                  nullptr, "token_expired", false, false, 0, eventOrigin);
     DynamicJsonDocument extra(64);
     extra["status"] = "token_expired";
     mqtt_publish_reply(reqId, "wake_confirm", false, extra);
     wakeConfirmToken = "";
+    wakeId = "";
+    wakeOrigin = "";
     log_print("[mqtt] wake_confirm ignored: token expired\n");
     return;
   }
 
   // Token valid — send WoL
-  mqtt_begin_wake(target, reqId, "wake_confirm", false);
+  mqtt_log_wake(confirmWakeId, "confirmation_accepted", target, "wake_confirm",
+                nullptr, nullptr, false, false, 0, eventOrigin);
+  mqtt_begin_wake(target, reqId, "wake_confirm", false, confirmWakeId);
   log_print("[mqtt] wake confirmed WOL sent target=%s\n", target);
 }
 
 static void handle_wake_cancel(const String& reqId) {
+  if (wakeId.length() > 0) {
+    mqtt_log_wake(wakeId, "result", wakeTarget, "wake_cancel", "cancelled",
+                  nullptr, false, false, 0,
+                  wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
+  }
   wakeConfirmToken = "";
   mqttWakePending = false;
+  wakeId = "";
+  wakeOrigin = "";
   DynamicJsonDocument extra(64);
   extra["status"] = "cancelled";
   mqtt_publish_reply(reqId, "wake_cancel", true, extra);
@@ -370,6 +464,20 @@ static void mqtt_on_message(char* topic, byte* payload, unsigned int length) {
   DynamicJsonDocument doc(1024);
   DeserializationError err = deserializeJson(doc, jsonStr);
   if (err) {
+    String cmdName = doc["cmd"] | "";
+    if (cmdName == "wake_request" || cmdName == "wake_confirm") {
+      String rejectedWakeId = wake_new_id();
+      String target = doc["target"] | "";
+      String origin = doc["origin"] | "";
+      if (origin.length() > 32) origin.remove(32);
+      const char* originValue = origin.length() > 0 ? origin.c_str() : nullptr;
+      mqtt_log_wake(rejectedWakeId, "request_received", target,
+                    cmdName.c_str(), nullptr, nullptr, false, false, 0,
+                    originValue);
+      mqtt_log_wake(rejectedWakeId, "request_rejected", target,
+                    cmdName.c_str(), nullptr, "malformed_json", false, false,
+                    0, originValue);
+    }
     log_print("[mqtt] cmd parse failed: %s\n", err.c_str());
     // ponytail: silent drop on parse errors, no error topic reply
     return;
@@ -379,6 +487,20 @@ static void mqtt_on_message(char* topic, byte* payload, unsigned int length) {
   String cmdName = doc["cmd"] | "";
 
   if (reqId.length() == 0 || cmdName.length() == 0) {
+    if (cmdName == "wake_request" || cmdName == "wake_confirm") {
+      String rejectedWakeId = wake_new_id();
+      String target = doc["target"] | "";
+      String origin = doc["origin"] | "";
+      if (origin.length() > 32) origin.remove(32);
+      const char* originValue = origin.length() > 0 ? origin.c_str() : nullptr;
+      mqtt_log_wake(rejectedWakeId, "request_received", target,
+                    cmdName.c_str(), nullptr, nullptr, false, false, 0,
+                    originValue);
+      mqtt_log_wake(rejectedWakeId, "request_rejected", target,
+                    cmdName.c_str(), nullptr,
+                    reqId.length() == 0 ? "missing_request_id" : "missing_command",
+                    false, false, 0, originValue);
+    }
     log_print("[mqtt] cmd missing id or cmd field\n");
     return;
   }
@@ -565,20 +687,30 @@ void mqtt_loop() {
 
     if (wake_is_pc_reachable(wakeTargetIp, wakeProbePort)) {
       // PC is online!
+      mqtt_log_wake(wakeId, "result", wakeTarget, "wake_request", "success",
+                    nullptr, false, false, millis() - wakeStartMs,
+                    wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
       mqttWakePending = false;
       lastWakeResult = "pc_online";
       lastWakeAt = millis() / 1000;
       mqtt_publish_state(true);
       mqtt_publish_event("pc_online", wakeTarget.c_str());
+      wakeId = "";
+      wakeOrigin = "";
       log_print("[mqtt] wake complete: %s online in %lums\n",
                 wakeTarget.c_str(), millis() - wakeStartMs);
     } else if (millis() - wakeStartMs >= WAKE_TIMEOUT_MS) {
       // Timeout
+      mqtt_log_wake(wakeId, "result", wakeTarget, "wake_request", "timeout",
+                    nullptr, false, false, millis() - wakeStartMs,
+                    wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
       mqttWakePending = false;
       lastWakeResult = "timeout";
       lastWakeAt = millis() / 1000;
       mqtt_publish_state(true);
       mqtt_publish_event("pc_timeout", wakeTarget.c_str());
+      wakeId = "";
+      wakeOrigin = "";
       log_print("[mqtt] wake timeout: %s not online after %lums\n",
                 wakeTarget.c_str(), WAKE_TIMEOUT_MS);
     }
@@ -586,7 +718,12 @@ void mqtt_loop() {
 
   // Clean up expired confirmation tokens
   if (wakeConfirmToken.length() > 0 && millis() > wakeConfirmExpiresMs) {
+    mqtt_log_wake(wakeId, "request_rejected", wakeTarget, "wake_request",
+                  nullptr, "confirmation_expired", false, false, 0,
+                  wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
     wakeConfirmToken = "";
+    wakeId = "";
+    wakeOrigin = "";
     log_print("[mqtt] wake confirm token expired\n");
   }
   if (rebootConfirmToken.length() > 0 && millis() > rebootConfirmExpiresMs) {

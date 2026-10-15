@@ -33,6 +33,9 @@ static const int MAX_BACKOFF_MS = 30000;
 static const int MAX_UPDATES = 1;
 static TaskHandle_t telegramPollTaskHandle = nullptr;
 static WiFiClientSecure tlsClient; // ponytail: single persistent client
+// shortcut: cap unresolved prompts at 16; raise if users routinely leave more open.
+static const size_t MAX_PENDING_WAKE_PROMPTS = 16;
+static String pendingWakePromptIds[MAX_PENDING_WAKE_PROMPTS];
 
 static void telegram_poll_task(void *pv);
 static void handleCommand(String chatId, String text);
@@ -236,6 +239,60 @@ static String menuText() {
   return msg;
 }
 
+static bool telegram_wake_id_valid(const String& id) {
+  if (id.length() != 8) return false;
+  for (unsigned int i = 0; i < id.length(); i++) {
+    char c = id[i];
+    if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+          (c >= 'A' && c <= 'F'))) return false;
+  }
+  return true;
+}
+
+static void telegram_log_wake(const String& wakeId, const char* event,
+                              const char* requestType = nullptr,
+                              const char* reason = nullptr,
+                              bool packetAttempted = false, bool sent = false) {
+  if (!log_enabled()) return;
+  DynamicJsonDocument fields(384);
+  fields["wake_id"] = wakeId;
+  fields["source"] = "telegram";
+  fields["target"] = PC_NAME;
+  if (requestType) fields["request_type"] = requestType;
+  if (reason) fields["reason"] = reason;
+  if (packetAttempted) {
+    fields["sent"] = sent;
+    fields["target_mac"] = PC_MAC;
+    fields["broadcast"] = WOL_BCAST;
+    fields["port"] = WOL_PORT;
+  }
+  const char* level = reason || (packetAttempted && !sent) ? "warn" : "info";
+  log_event_fields(level, "wake", event, fields.as<JsonObjectConst>());
+}
+
+static bool telegram_register_wake_prompt(const String& id) {
+  int freeSlot = -1;
+  for (size_t i = 0; i < MAX_PENDING_WAKE_PROMPTS; i++) {
+    if (pendingWakePromptIds[i] == id) return false;
+    if (freeSlot < 0 && pendingWakePromptIds[i].length() == 0) {
+      freeSlot = (int)i;
+    }
+  }
+  if (freeSlot < 0) return false;
+  pendingWakePromptIds[freeSlot] = id;
+  return true;
+}
+
+static bool telegram_consume_wake_prompt(const String& id) {
+  for (size_t i = 0; i < MAX_PENDING_WAKE_PROMPTS; i++) {
+    if (pendingWakePromptIds[i] == id) {
+      pendingWakePromptIds[i] = "";
+      return true;
+    }
+  }
+  return false;
+}
+
 static void handleCommand(String chatId, String text) {
   text.trim();
   log_print("[telegram] handleCommand chat=%s text=%s\n", chatId.c_str(),
@@ -299,17 +356,31 @@ static void handleCommand(String chatId, String text) {
   }
 
   if (cmd == "/wake") {
+    String wakeId = wake_new_id();
+    telegram_log_wake(wakeId, "request_received", "command");
     bool forceWake = args.indexOf("force") >= 0 || args.indexOf("--force") >= 0 ||
                      args.indexOf("-f") >= 0;
     if (forceWake) {
       log_print("[telegram] /wake force start\n");
-      wake_send_magic(PC_MAC, WOL_BCAST, WOL_PORT);
-      wake_start_polling(chatId, PC_NAME, PC_IP, PC_TCP_PORT);
-      telegram_send_text_once(chatId,
-                              "⚡ Wake signal sent to " + String(PC_NAME) +
-                                  " — waiting up to 90s for PC to respond...",
-                              "");
+      bool sent = wake_send_magic(PC_MAC, WOL_BCAST, WOL_PORT);
+      telegram_log_wake(wakeId, "packet_sent", nullptr, nullptr, true, sent);
+      wake_start_polling(chatId, PC_NAME, PC_IP, PC_TCP_PORT, wakeId);
+      String response = sent
+                            ? "⚡ Wake signal sent to " + String(PC_NAME) +
+                                  " — waiting up to 90s for PC to respond..."
+                            : "⚠️ WoL send failed for " + String(PC_NAME) +
+                                  "; checking whether it comes online anyway.";
+      telegram_send_text_once(chatId, response, "");
       log_print("[telegram] /wake force done\n");
+      return;
+    }
+
+    if (!telegram_register_wake_prompt(wakeId)) {
+      telegram_log_wake(wakeId, "request_rejected", "command",
+                        "pending_prompt_limit");
+      telegram_send_text_once(chatId,
+                              "Too many pending wake confirmations. Cancel or confirm an existing one first.",
+                              "");
       return;
     }
 
@@ -321,13 +392,18 @@ static void handleCommand(String chatId, String text) {
     JsonArray row = rows.createNestedArray();
     JsonObject yes = row.createNestedObject();
     yes["text"] = "✅ Yes";
-    yes["callback_data"] = "wake_confirm";
+    yes["callback_data"] = "wake_confirm:" + wakeId;
     JsonObject no = row.createNestedObject();
     no["text"] = "❌ No";
-    no["callback_data"] = "wake_cancel";
+    no["callback_data"] = "wake_cancel:" + wakeId;
     log_print("[telegram] /wake reply start\n");
-    telegram_send_json_once("sendMessage", payload.as<JsonObject>(),
-                            "sendMessage");
+    bool prompted = telegram_send_json_once("sendMessage", payload.as<JsonObject>(),
+                                            "sendMessage");
+    if (!prompted) {
+      telegram_consume_wake_prompt(wakeId);
+      telegram_log_wake(wakeId, "request_rejected", "command",
+                        "confirmation_prompt_failed");
+    }
     log_print("[telegram] /wake reply done\n");
     return;
   }
@@ -349,21 +425,54 @@ static void handleCommand(String chatId, String text) {
 static void handleCallback(const TelegramUpdate &msg) {
   log_print("[telegram] handleCallback chat=%s data=%s\n", msg.chat_id.c_str(),
             msg.text.c_str());
-  if (msg.text == "wake_confirm") {
-    log_print("[telegram] callback confirm start\n");
-    telegram_send_callback_answer_once(msg.query_id, "", false, "", 0);
-    wake_send_magic(PC_MAC, WOL_BCAST, WOL_PORT);
-    wake_start_polling(msg.chat_id, PC_NAME, PC_IP, PC_TCP_PORT);
-    telegram_send_text_once(msg.chat_id,
-                            "⚡ Wake signal sent to " + String(PC_NAME) +
-                                " — waiting up to 90s for PC to respond...",
-                            "");
-    log_print("[telegram] callback confirm done\n");
-  } else if (msg.text == "wake_cancel") {
-    log_print("[telegram] callback cancel start\n");
-    telegram_send_callback_answer_once(msg.query_id, "Cancelled", false, "", 0);
-    log_print("[telegram] callback cancel done\n");
+
+  bool confirmation = msg.text == "wake_confirm" ||
+                      msg.text.startsWith("wake_confirm:");
+  bool cancellation = msg.text == "wake_cancel" ||
+                      msg.text.startsWith("wake_cancel:");
+  if (!confirmation && !cancellation) return;
+
+  bool legacy = msg.text == "wake_confirm" || msg.text == "wake_cancel";
+  const char* requestType = confirmation ? "confirmation" : "cancellation";
+  String prefix = confirmation ? "wake_confirm:" : "wake_cancel:";
+  String wakeId = legacy ? "" : msg.text.substring(prefix.length());
+  if (legacy || !telegram_wake_id_valid(wakeId)) {
+    wakeId = wake_new_id();
+    telegram_log_wake(wakeId, "request_received", requestType);
+    telegram_log_wake(wakeId, "request_rejected", requestType,
+                      legacy ? "legacy_callback" : "invalid_confirmation_id");
+    telegram_send_callback_answer_once(
+        msg.query_id, "This wake confirmation is invalid or expired.", true, "", 0);
+    return;
   }
+
+  telegram_log_wake(wakeId, confirmation ? "confirmation_received"
+                                         : "cancellation_received");
+  if (!telegram_consume_wake_prompt(wakeId)) {
+    telegram_log_wake(wakeId, "request_rejected", requestType,
+                      "unknown_or_consumed_callback");
+    telegram_send_callback_answer_once(
+        msg.query_id, "This wake confirmation is invalid or expired.", true, "", 0);
+    return;
+  }
+
+  if (cancellation) {
+    telegram_log_wake(wakeId, "request_rejected", requestType,
+                      "cancelled_by_user");
+    telegram_send_callback_answer_once(msg.query_id, "Cancelled", false, "", 0);
+    return;
+  }
+
+  telegram_send_callback_answer_once(msg.query_id, "", false, "", 0);
+  bool sent = wake_send_magic(PC_MAC, WOL_BCAST, WOL_PORT);
+  telegram_log_wake(wakeId, "packet_sent", nullptr, nullptr, true, sent);
+  wake_start_polling(msg.chat_id, PC_NAME, PC_IP, PC_TCP_PORT, wakeId);
+  String response = sent
+                        ? "⚡ Wake signal sent to " + String(PC_NAME) +
+                              " — waiting up to 90s for PC to respond..."
+                        : "⚠️ WoL send failed for " + String(PC_NAME) +
+                              "; checking whether it comes online anyway.";
+  telegram_send_text_once(msg.chat_id, response, "");
 }
 
 static int parse_updates(const String &response, TelegramUpdate *updates,

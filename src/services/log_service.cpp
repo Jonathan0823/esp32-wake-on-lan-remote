@@ -75,6 +75,10 @@ static void send_loki_line(const char* log_line) {
   free(payload);
 }
 
+bool log_enabled() {
+  return grafanaConfigured;
+}
+
 void log_init() {
   grafanaConfigured =
     strlen(GRAFANA_LOGS_URL) > 0 &&
@@ -126,6 +130,38 @@ void log_event(const char* level, const char* component,
 
   free(escaped);
   free(log_line);
+}
+
+void log_event_fields(const char* level, const char* component,
+                      const char* event, JsonObjectConst fields) {
+  if (!grafanaConfigured) return;
+
+  DynamicJsonDocument doc(1024);
+  for (JsonPairConst field : fields) {
+    doc[field.key()] = field.value();
+  }
+  doc["level"] = level;
+  doc["component"] = component;
+  doc["event"] = event;
+
+  String ipStr;
+  int rssi = 0;
+  if (WiFi.status() == WL_CONNECTED) {
+    ipStr = WiFi.localIP().toString();
+    rssi = WiFi.RSSI();
+  }
+  doc["uptime_s"] = (unsigned long)(millis() / 1000);
+  doc["heap"] = ESP.getFreeHeap();
+  doc["rssi"] = rssi;
+  doc["ip"] = ipStr;
+
+  String logLine;
+  serializeJson(doc, logLine);
+  if (logLine.length() < 1024) {
+    send_loki_line(logLine.c_str());
+  } else {
+    log_print("[log] truncated line skipped (grafana)\n");
+  }
 }
 
 void log_print(const char* fmt, ...) {
