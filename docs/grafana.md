@@ -44,4 +44,10 @@ All logs arrive at `{app="esp32-pc-remote"}`.
 - Poll fail streak >= 3
 - Reset reason = brownout or panic
 
-Wake logs share a `wake_id` across request, packet, and result events. Filter on `component="wake"` and group by `wake_id`. Grafana delivery is best-effort, so a missing event alone does not prove the ESP32 did not send a WoL packet.
+Wake logs share a `wake_id` across request, packet, and result events. In Explore, select the application stream, parse the JSON log line, then filter on its extracted component field:
+
+```logql
+{app="esp32-pc-remote"} | json | component="wake"
+```
+
+Use the extracted `wake_id` field to group lifecycle entries in the Logs view, or isolate one attempt by adding `| wake_id="a1b2c3d4"` after the component filter. `wake_id` is an extracted JSON field, not a stream label. Grafana delivery is best-effort, so a missing event alone does not prove the ESP32 did not send a WoL packet.
