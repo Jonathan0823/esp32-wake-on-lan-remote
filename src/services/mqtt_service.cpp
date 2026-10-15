@@ -219,7 +219,7 @@ static void mqtt_begin_wake(const char* target, const String& reqId,
                 sent ? "sent" : "send_failed", nullptr, true, sent, 0,
                 wakeOrigin.length() > 0 ? wakeOrigin.c_str() : nullptr);
 
-  lastWakeResult = "wol_sent";
+  lastWakeResult = sent ? "wol_sent" : "wol_send_failed";
   lastWakeAt = millis() / 1000;
 
   mqttWakePending = true;
@@ -233,14 +233,16 @@ static void mqtt_begin_wake(const char* target, const String& reqId,
 
   DynamicJsonDocument extra(128);
   extra["target"] = target;
-  extra["result"] = "wol_sent";
+  extra["result"] = lastWakeResult;
+  extra["sent"] = sent;
   if (forced) {
     extra["forced"] = true;
   }
-  mqtt_publish_reply(reqId, cmdName, true, extra);
+  mqtt_publish_reply(reqId, cmdName, sent, extra);
   mqtt_publish_state(true);
-  mqtt_publish_event("wol_sent", target);
-  log_print("[mqtt] wake sent target=%s forced=%d\n", target, forced);
+  mqtt_publish_event(sent ? "wol_sent" : "wol_send_failed", target);
+  log_print("[mqtt] wake %s target=%s forced=%d\n",
+            sent ? "sent" : "send failed", target, forced);
 }
 
 static void handle_wake_request(const String& reqId, DynamicJsonDocument& doc) {
